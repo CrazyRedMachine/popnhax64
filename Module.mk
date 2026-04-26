@@ -26,10 +26,10 @@ $(BUILDDIR)/popnhax.zip: \
 zipdir          := $(BUILDDIR)/zip
 
 $(BUILDDIR)/popnhax_v$(popnhax_version).zip: \
-	build/bin/avs2_1700-32/popnhax.dll
+	build/bin/avs2_1700-64/popnhax.dll
 	@echo ... $@
 	@mkdir -p $(zipdir)
-	@cp -a -p build/bin/avs2_1700-32/popnhax.dll $(zipdir)
+	@cp -a -p build/bin/avs2_1700-64/popnhax.dll $(zipdir)
 	@cp -r -a -p dist/popnhax/* $(zipdir)
 	@cd $(zipdir) \
 	&& zip -r ../popnhax_v$(popnhax_version).zip ./*
