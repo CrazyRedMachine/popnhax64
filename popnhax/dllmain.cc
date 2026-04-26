@@ -16,6 +16,8 @@
 #include "util/patch.h"
 #include "util/xmlprop.hpp"
 
+#define PROGRAM_VERSION "0.1.dev"
+
 struct popnhax_config config = {};
 
 PSMAP_BEGIN(config_psmap, static)
