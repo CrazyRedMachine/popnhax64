@@ -18,6 +18,16 @@
 
 #define PROGRAM_VERSION "0.1.dev"
 
+FILE *g_log_fp = NULL;
+
+#define LOG(...) do { \
+if (g_log_fp != NULL) { \
+fprintf(g_log_fp, __VA_ARGS__); \
+fflush(g_log_fp);\
+ }\
+fprintf(stderr, __VA_ARGS__); \
+} while (0)
+
 struct popnhax_config config = {};
 
 PSMAP_BEGIN(config_psmap, static)
@@ -32,6 +42,42 @@ PSMAP_MEMBER_REQ(PSMAP_PROPERTY_TYPE_BOOL, struct popnhax_config, unlock_all, "/
 PSMAP_MEMBER_REQ(PSMAP_PROPERTY_TYPE_BOOL, struct popnhax_config, skip_tutorials,
                  "/popnhax/skip_tutorials")
 PSMAP_END
+
+double g_multiplier = 1.;
+DWORD (*real_timeGetTime)();
+DWORD patch_timeGetTime()
+{
+ static DWORD last_real = 0;
+ static DWORD cumul_offset = 0;
+
+ if (last_real == 0)
+ {
+     last_real = real_timeGetTime()*g_multiplier;
+     return last_real;
+ }
+
+ DWORD real = real_timeGetTime()*g_multiplier;
+ DWORD elapsed = real-last_real;
+ if (elapsed > 16) cumul_offset+= elapsed;
+
+ last_real = real;
+ return real - cumul_offset;
+
+}
+
+bool patch_get_time(double time_rate)
+{
+    if (time_rate == 0)
+        return true;
+
+    g_multiplier = time_rate;
+    HMODULE hinstLib = GetModuleHandleA("winmm.dll");
+    MH_CreateHook((LPVOID)GetProcAddress(hinstLib, "timeGetTime"), (LPVOID)patch_timeGetTime,
+                      (void **)&real_timeGetTime);
+
+    LOG("popnhax: time multiplier: %f\n", time_rate);
+    return true;
+}
 
 static bool patch_unset_volume() {
     DWORD dllSize = 0;
@@ -412,6 +458,94 @@ static bool patch_skip_tutorials() {
     return true;
 }
 
+uint64_t *g_rend_addr;
+uint64_t *font_color;
+uint64_t *font_rend_func;
+
+const char stats_disp_header[] = " - HELLO WORLD - ";
+const char stats_disp_format[] = "%s";
+void enhanced_polling_stats_disp_sub()
+{
+    __asm("mov r9, %0\n"::"a"(stats_disp_header));  //varg
+    __asm("mov r8, %0\n"::"a"(stats_disp_format));  // format
+    __asm("mov rdx, 0x2A\n");                        // Y coord
+    __asm("mov rcx, 0x160\n");                       // X coord
+//__asm("mov esi, %0\n"::"a"(*font_color+COLOR_LIGHT_GREY));
+    __asm("call %0\n"::"a"(font_rend_func));
+//__asm("add esp, 0x0C\n");
+}
+
+void (*real_render_loop)();
+void enhanced_polling_stats_disp()
+{
+    __asm("mov eax, [%0]\n"::"a"(g_rend_addr));
+    __asm("cmp byte ptr [eax], 0\n");
+    __asm("je call_stat_menu\n");
+    __asm("mov dword ptr [eax], 2\n");
+    __asm("mov dword ptr [eax+4], 0\n"); //1
+    //__asm("mov dword ptr [eax+8], 0\n");
+    __asm("mov dword ptr [eax+0x34], 1\n");
+
+    __asm("call_stat_menu:\n");
+    enhanced_polling_stats_disp_sub();
+    real_render_loop();
+}
+
+static bool patch_enhanced_polling_stats() {
+    DWORD dllSize = 0;
+    char *data = getDllData("popn.dll", &dllSize);
+
+    {
+        fuzzy_search_task task;
+
+        FUZZY_START(task, 1)
+        FUZZY_CODE(task, 0, "\x4C\x89\x44\x24\x18\x4C\x89\x4C\x24\x20\x53\x55\x56\x57\x41\x56\x48\x83", 18)
+
+        int64_t pattern_offset = find_block(data, dllSize, &task, 0);
+        if (pattern_offset == -1) {
+            return false;
+        }
+
+        font_rend_func = (uint64_t *)((uint64_t)data + pattern_offset);
+        LOG("popnhax: get_rendaddr: font_rend_func is 0x%llX\n", (uint64_t)font_rend_func);
+    }
+    {
+        fuzzy_search_task task;
+
+        FUZZY_START(task, 1)
+        FUZZY_CODE(task, 0, "\x48\x8B\x05\xE5\x3C\xCF\x00", 7)
+
+        int64_t pattern_offset = find_block(data, dllSize, &task, 0);
+        if (pattern_offset == -1) {
+            return false;
+        }
+
+	//LOG("found pattern at address 0x%llX\n", (uint64_t)data+pattern_offset+7+);
+        g_rend_addr = (uint64_t *)((uint64_t)data + pattern_offset + 7 + 0xCF3CE5);
+        LOG("popnhax: get_rendaddr: g_rend_addr is 0x%llX\n", (uint64_t)g_rend_addr);
+    }
+
+    {
+        fuzzy_search_task task;
+
+        FUZZY_START(task, 1)
+        FUZZY_CODE(task, 0, "\x48\x81\xEC\x98\x00\x00\x00\x48\x8B\x05\xD2\x1B", 12)
+
+        int64_t pattern_offset = find_block(data, dllSize, &task, 0);
+        if (pattern_offset == -1) {
+	    LOG("popnhax: cannot find AGING loop");
+            return false;
+        }
+
+        uint64_t patch_addr = (uint64_t)data + pattern_offset + 7;
+        MH_CreateHook((LPVOID)patch_addr, (LPVOID)enhanced_polling_stats_disp,
+                      (void **)&real_render_loop);
+	LOG("popnhax: hook installed");
+    }
+
+    return true;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH: {
@@ -423,35 +557,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
         _load_config("popnhax.xml", &config, config_psmap);
 
-        if (config.unset_volume) {
-            patch_unset_volume();
-        }
-
-        if (config.event_mode) {
-            patch_event_mode();
-        }
-
-        if (config.remove_timer) {
-            patch_remove_timer();
-        }
-
-        if (config.freeze_timer) {
-            patch_freeze_timer();
-        }
-
-        if (config.unlock_all) {
-            // patch_hidden_charts_3();
-            // patch_hidden_charts_7();
-            patch_unlock_classic8();
-            patch_unlock_all();
-        }
-
-        if (config.skip_tutorials) {
-            patch_skip_tutorials();
-        }
-
+	patch_enhanced_polling_stats();
+        patch_get_time(1.);
+	
         MH_EnableHook(MH_ALL_HOOKS);
-
+Sleep(3000); // time to read the logs
         break;
     }
 
