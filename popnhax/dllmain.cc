@@ -1,6 +1,7 @@
 // clang-format off
 #include <windows.h>
 #include <psapi.h>
+#include <process.h>
 // clang-format on
 
 #include <stddef.h>
@@ -529,7 +530,8 @@ static bool patch_enhanced_polling_stats() {
         fuzzy_search_task task;
 
         FUZZY_START(task, 1)
-        FUZZY_CODE(task, 0, "\x48\x81\xEC\x98\x00\x00\x00\x48\x8B\x05\xD2\x1B", 12)
+        FUZZY_CODE(task, 0, "\x48\x8B\x7B\x10\x48\x8B\xCF\xE8\xB5", 9)
+	//FUZZY_CODE(task, 0, "\x48\x81\xEC\x98\x00\x00\x00\x48\x8B\x05\xD2\x1B", 12)
 
         int64_t pattern_offset = find_block(data, dllSize, &task, 0);
         if (pattern_offset == -1) {
@@ -537,12 +539,252 @@ static bool patch_enhanced_polling_stats() {
             return false;
         }
 
-        uint64_t patch_addr = (uint64_t)data + pattern_offset + 7;
+        uint64_t patch_addr = (uint64_t)data + pattern_offset - 9;
+        //uint64_t patch_addr = (uint64_t)data + pattern_offset + 7;
         MH_CreateHook((LPVOID)patch_addr, (LPVOID)enhanced_polling_stats_disp,
                       (void **)&real_render_loop);
 	LOG("popnhax: hook installed");
     }
 
+    return true;
+}
+
+struct AIO_IOB5_BI3A {
+    uint8_t data[0x4FF0];
+};
+
+union AIO_IOB5_BI3A__DEVSTATUS {
+    uint8_t RawBytes[648];
+    struct {
+        uint8_t Reserved0[27];  // 0-26
+        uint8_t Coin0;          // 27
+        uint8_t Coin1;          // 28
+        uint8_t Reserved1[15];  // 29-43
+        uint8_t TestButton;     // 44, io code offset rcx+0xe4
+        uint8_t ServiceButton;  // 45, io code offset rcx+0xe5
+        uint8_t CoinMech;       // 46, io code offset rcx+0xe6
+        uint8_t Reserved2[19];  // 47-65
+        uint8_t JOYL_SW;        // 66
+        uint8_t Reserved3[4];   // 67-70
+        uint8_t JOYR_SW;        // 71
+        uint8_t Headphones;     // 72
+        uint8_t Recorder;       // 73, unused
+        uint8_t Reserved4[295]; // 74-368
+        uint16_t Buttons;    // 369
+    } Input;
+};
+
+volatile uint8_t g_enhanced_poll_ready = 0;
+AIO_IOB5_BI3A *g_BI3A = NULL;
+AIO_IOB5_BI3A__DEVSTATUS *g_BI3A_STATUS = NULL;
+
+void (__fastcall *mGetDeviceStatus)(AIO_IOB5_BI3A *,AIO_IOB5_BI3A__DEVSTATUS*) = NULL;
+
+uint32_t g_poll_rate_avg = 0;
+uint32_t g_last_button_state = 0;
+uint8_t g_debounce = 0;
+int32_t g_button_state[9] = {0};
+static unsigned int __stdcall enhanced_polling_proc(void *ctx)
+{
+    HMODULE hinstLib = GetModuleHandleA("libaio-iob5.dll");
+    //mGetDeviceStatus = (void(*)(AIO_IOB5_BI3A *,AIO_IOB5_BI3A__DEVSTATUS*))GetProcAddress(hinstLib, "?GetDeviceStatus@AIO_IOB5_BI3A@@QEBAXAEAUDEVSTATUS@1@@Z");
+    mGetDeviceStatus = (void(*)(AIO_IOB5_BI3A *,AIO_IOB5_BI3A__DEVSTATUS*))GetProcAddress(hinstLib, "aioIob5Bi3a_GetDeviceStatus");
+    static uint8_t button_debounce[9] = {0};
+printf("POLLING THREAD RUNNING\n");
+    for (int i=0; i<9; i++)
+    {
+        g_button_state[i] = -1;
+    }
+
+    while (!g_enhanced_poll_ready)
+    {
+        Sleep(500);
+    }
+/*
+    if (config.enhanced_polling_priority)
+    {
+        SetThreadPriority(GetCurrentThread(), config.enhanced_polling_priority);
+        LOG("[Enhanced polling] Thread priority set to %d\n", GetThreadPriority(GetCurrentThread()));
+    }
+*/
+    uint32_t curr_poll_time = 0;
+    uint32_t prev_poll_time = 0;
+    while (g_enhanced_poll_ready)
+    {
+        //uint32_t pad_bits;
+        /* ensure at least 1ms has elapsed between polls
+         * (beware of SD cab hardware compatibility)
+         */
+        curr_poll_time = timeGetTime();
+        if (curr_poll_time == prev_poll_time)
+        {
+            curr_poll_time++;
+            Sleep(1);
+        }
+        prev_poll_time = curr_poll_time;
+
+        mGetDeviceStatus(g_BI3A, g_BI3A_STATUS);
+
+        g_last_button_state = g_BI3A_STATUS->Input.Buttons;
+
+        unsigned int buttonState = (g_last_button_state) & 0x1FF;
+        for (int i = 0; i < 9; i++)
+        {
+            if ( ((buttonState >> i)&1) )
+            {
+                if (g_button_state[i] == -1)
+                {
+                    g_button_state[i] = curr_poll_time;
+                }
+                //debounce on release (since we're forced to stub usbPadReadLast)
+                button_debounce[i] = g_debounce;
+            }
+            else
+            {
+                if (button_debounce[i]>0)
+                {
+                    button_debounce[i]--;
+                }
+
+                if (button_debounce[i] == 0)
+                {
+                    g_button_state[i] = -1;
+                }
+                else
+                {
+                    //debounce ongoing: flag button as still pressed
+                    g_last_button_state |= 1<<(i);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/*
+on hook juste après le mov dans esi ( 45 32 FF .43 8B 74 D1 08 + 0x08 )
+-> RDX contient le num du bouton (0-index), ESI le delta à compenser 
+=> soustraire à esi la valeur de g_sincewhen[rdx]) /!\ si et seulement si esi != 0x400 /!\
+*/
+uint32_t buttonGetMillis(uint8_t button)
+{
+    if (g_button_state[button] == -1)
+        return 0;
+
+    uint32_t but = g_button_state[button];
+    uint32_t curr = timeGetTime();
+    if (but <= curr)
+    {
+        uint32_t res = curr - but;
+        return res;
+    }
+
+    return 0;
+}
+
+uint32_t g_offset_fix[9] = {0};
+uint8_t g_poll_index = 0;
+void (*real_timing_eval)();
+void enhanced_polling_hook_timing_eval() {
+    /* eax contains button being checked [0-8] -> RDX mtn
+     * esi contains delta about to be evaluated 
+     * we need to do esi -= buttonGetMillis([%eax]); -> %rdx to fix the offset accurately */
+    __asm("push rbx\n");
+
+    __asm("mov %0, dl\n":"=m"(g_poll_index): :);
+
+    /* reimplem buttonGetMillis(), result in ebx */
+    __asm("xor ebx,ebx\n");
+    __asm("mov edx,dword ptr ds:[rdx*4+%0]\n"::"a"(g_button_state));
+    __asm("cmp edx,0xFFFFFFFF\n");
+    __asm("je button_state_empty\n");
+
+    __asm("push rcx\n");
+    __asm("push rdx\n");
+    __asm("call %P0" : : "d"(timeGetTime));
+    __asm("pop rdx\n");
+    __asm("pop rcx\n");
+    __asm("cmp edx,eax\n");
+
+    __asm("jbe button_has_been_pressed\n");
+
+    __asm("restore_rdx:\n");
+    __asm("movzx rdx, %0\n": :"d"(g_poll_index));
+
+    /* leave buttonGetMillis */
+    __asm("button_state_empty:\n");
+    __asm("sub esi, ebx\n"); // actual delta correction
+    __asm("mov rdx, rcx\n");
+    __asm("lea rax,dword ptr [rdx*4+%0]\n"::"a"(g_offset_fix));
+    __asm("mov [rax], ebx\n"::); // save correction value in g_offset_fix[g_poll_index];
+
+    __asm("pop rbx\n");
+	__asm("mov rax, %0\n" : : "m"(real_timing_eval));
+    __asm("jmp rax");
+
+    __asm("button_has_been_pressed:\n");
+    __asm("sub eax,edx\n"); // eax = correction value (currTime - g_button_state[g_poll_index]);
+    __asm("mov ebx, eax\n");// put correction value in ebx
+    __asm("jmp restore_rdx\n");
+}
+
+void (*real_getdevicestatus_call)();
+void enhanced_polling_hook_getdevicestatus_call()
+{
+    //__asm("cmp byte ptr[_g_enhanced_poll_ready], 1");
+    if ( g_enhanced_poll_ready )
+        __asm("jmp skip_getdevicestatus_call");
+
+    __asm("mov %0, rcx":"=m"(g_BI3A):);
+    __asm("mov %0, rdx":"=m"(g_BI3A_STATUS):);
+    g_enhanced_poll_ready = 1;
+    //__asm("mov %0, 0x01\n":"=m"(g_enhanced_poll_ready):);
+    __asm("skip_getdevicestatus_call:\n");
+	//memcpy( g_BI3A_STATUS, g_int_status, 648*sizeof(uint8_t));
+	__asm("mov rax, 0\n");
+    __asm("ret 0\n");
+}
+
+static HANDLE enhanced_polling_thread;
+
+static bool patch_enhanced_polling_prep() {
+    DWORD dllSize = 0;
+    char *data = getDllData("popn.dll", &dllSize);
+
+    {
+        fuzzy_search_task task;
+        FUZZY_START(task, 1)
+        FUZZY_CODE(task, 0, "\x49\x08\x48\xFF\x25\xA6\xAF\x16\x00", 9)
+
+        int64_t pattern_offset = find_block(data, dllSize, &task, 0);
+        if (pattern_offset == -1) {
+        LOG("popnhax: cannot find GetDeviceStatus call");
+            return false;
+        }
+
+        uint64_t patch_addr = (uint64_t)data + pattern_offset + 0x02;
+        MH_CreateHook((LPVOID)patch_addr, (LPVOID)enhanced_polling_hook_getdevicestatus_call,
+                      (void **)&real_getdevicestatus_call);
+    }
+
+    {
+        fuzzy_search_task task;
+        FUZZY_START(task, 1)
+        FUZZY_CODE(task, 0, "\x45\x32\xFF\x43\x8B\x74\xD1\x08", 8)
+
+        int64_t pattern_offset = find_block(data, dllSize, &task, 0);
+        if (pattern_offset == -1) {
+        LOG("popnhax: cannot find timing eval function");
+            return false;
+        }
+
+        uint64_t patch_addr = (uint64_t)data + pattern_offset + 0x08;
+        MH_CreateHook((LPVOID)patch_addr, (LPVOID)enhanced_polling_hook_timing_eval,
+                      (void **)&real_timing_eval);
+    }
+
+    LOG("popnhax: enhanced polling hooks installed");
+    enhanced_polling_thread = (HANDLE) _beginthreadex(NULL, 0, enhanced_polling_proc, NULL, 0, NULL);
     return true;
 }
 
@@ -559,6 +801,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
 	patch_enhanced_polling_stats();
         patch_get_time(1.);
+	patch_enhanced_polling_prep();
 	
         MH_EnableHook(MH_ALL_HOOKS);
 Sleep(3000); // time to read the logs
