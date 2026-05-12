@@ -555,7 +555,7 @@ struct AIO_IOB5_BI3A {
 
 union AIO_IOB5_BI3A__DEVSTATUS {
     uint8_t RawBytes[648];
-    struct {
+    struct __attribute__((packed)){
         uint8_t Reserved0[27];  // 0-26
         uint8_t Coin0;          // 27
         uint8_t Coin1;          // 28
@@ -570,7 +570,7 @@ union AIO_IOB5_BI3A__DEVSTATUS {
         uint8_t Headphones;     // 72
         uint8_t Recorder;       // 73, unused
         uint8_t Reserved4[295]; // 74-368
-        uint16_t Buttons;    // 369
+        uint16_t Buttons;    // 369  0x171
     } Input;
 };
 
@@ -582,12 +582,11 @@ void (__fastcall *mGetDeviceStatus)(AIO_IOB5_BI3A *,AIO_IOB5_BI3A__DEVSTATUS*) =
 
 uint32_t g_poll_rate_avg = 0;
 uint32_t g_last_button_state = 0;
-uint8_t g_debounce = 0;
+uint8_t g_debounce = 5;
 int32_t g_button_state[9] = {0};
 static unsigned int __stdcall enhanced_polling_proc(void *ctx)
 {
     HMODULE hinstLib = GetModuleHandleA("libaio-iob5.dll");
-    //mGetDeviceStatus = (void(*)(AIO_IOB5_BI3A *,AIO_IOB5_BI3A__DEVSTATUS*))GetProcAddress(hinstLib, "?GetDeviceStatus@AIO_IOB5_BI3A@@QEBAXAEAUDEVSTATUS@1@@Z");
     mGetDeviceStatus = (void(*)(AIO_IOB5_BI3A *,AIO_IOB5_BI3A__DEVSTATUS*))GetProcAddress(hinstLib, "aioIob5Bi3a_GetDeviceStatus");
     static uint8_t button_debounce[9] = {0};
 printf("POLLING THREAD RUNNING\n");
@@ -701,7 +700,11 @@ void enhanced_polling_hook_timing_eval() {
 
     __asm("push rcx\n");
     __asm("push rdx\n");
+    __asm("push r9\n");
+    __asm("push r10\n");
     __asm("call %P0" : : "d"(timeGetTime));
+    __asm("pop r10\n");
+    __asm("pop r9\n");
     __asm("pop rdx\n");
     __asm("pop rcx\n");
     __asm("cmp edx,eax\n");
